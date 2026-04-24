@@ -11,13 +11,39 @@ import { log } from './log.js';
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
+/**
+ * Whether the container runtime is rootless (e.g. rootless Podman).
+ * Detected once at module load; `docker info` is fast and synchronous here.
+ * Rootless runtimes remap the host user's UID to container UID 0, so
+ * bind-mounted files appear owned by root inside the container. `--userns=keep-id`
+ * preserves the UID mapping so mounted files remain writable by the container user.
+ */
+function detectRootless(): boolean {
+  if (os.platform() !== 'linux') return false;
+  try {
+    const info = execSync(`${CONTAINER_RUNTIME_BIN} info`, { stdio: 'pipe', encoding: 'utf-8', timeout: 5000 });
+    return /rootless:\s*true/i.test(info);
+  } catch {
+    return false;
+  }
+}
+
+const IS_ROOTLESS = detectRootless();
+
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
+  const args: string[] = [];
   // On Linux, host.docker.internal isn't built-in — add it explicitly
   if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
+    args.push('--add-host=host.docker.internal:host-gateway');
   }
-  return [];
+  // Rootless runtimes (e.g. rootless Podman) remap the host UID to container
+  // UID 0, so bind-mounted files appear owned by root. --userns=keep-id
+  // preserves the mapping so the container user can write to mounted files.
+  if (IS_ROOTLESS) {
+    args.push('--userns=keep-id');
+  }
+  return args;
 }
 
 /** Returns CLI args for a readonly bind mount. */

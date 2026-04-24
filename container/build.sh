@@ -12,6 +12,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
 
+# Allow .env to pin the canonical project root for consistent image naming.
+# This matters when the repo is reachable via two filesystem paths (e.g. bind
+# mounts): without it, `pwd` may resolve to a different path than the one the
+# running service uses, producing a mismatched image tag.
+if [ -z "${NANOCLAW_PROJECT_ROOT:-}" ] && [ -f "$PROJECT_ROOT/.env" ]; then
+    _root_val="$(grep '^NANOCLAW_PROJECT_ROOT=' "$PROJECT_ROOT/.env" | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
+    if [ -n "$_root_val" ]; then
+        export NANOCLAW_PROJECT_ROOT="$_root_val"
+    fi
+fi
+
 # Derive the image name from the project root so two NanoClaw installs on the
 # same host don't overwrite each other's `nanoclaw-agent:latest` tag. Matches
 # setup/lib/install-slug.sh + src/install-slug.ts.
