@@ -23,6 +23,7 @@ const STEPS: Record<
   onecli: () => import('./onecli.js'),
   auth: () => import('./auth.js'),
   'cli-agent': () => import('./cli-agent.js'),
+  'pair-telegram': () => import('./pair-telegram.js'),
 };
 
 async function main(): Promise<void> {
