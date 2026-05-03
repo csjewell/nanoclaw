@@ -2,8 +2,12 @@ import { findByName, getAllDestinations, type DestinationEntry } from './destina
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
-import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
-import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
+import {
+  clearContinuation,
+  migrateLegacyContinuation,
+  setContinuation,
+} from './db/session-state.js';
+import { formatMessages, extractRouting, categorizeMessage, isClearCommand, isRunnerCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -19,6 +23,12 @@ function generateId(): string {
 
 export interface PollLoopConfig {
   provider: AgentProvider;
+  /**
+   * Name of the provider (e.g. "claude", "codex", "opencode"). Used to key
+   * the stored continuation per-provider so flipping providers doesn't
+   * resurrect a stale id from a different backend.
+   */
+  providerName: string;
   cwd: string;
   systemContext?: {
     instructions?: string;
@@ -39,8 +49,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // Resume the agent's prior session from a previous container run if one
   // was persisted. The continuation is opaque to the poll-loop — the
   // provider decides how to use it (Claude resumes a .jsonl transcript,
-  // other providers may reload a thread ID, etc.).
-  let continuation: string | undefined = getStoredSessionId();
+  // other providers may reload a thread ID, etc.). Keyed per-provider so
+  // a Codex thread id never gets handed to Claude or vice versa.
+  let continuation: string | undefined = migrateLegacyContinuation(config.providerName);
 
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
@@ -94,7 +105,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isClearCommand(msg)) {
         log('Clearing session (resetting continuation)');
         continuation = undefined;
-        clearStoredSessionId();
+        clearContinuation(config.providerName);
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
@@ -160,10 +171,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds);
+      const result = await processQuery(query, routing, processingIds, config.providerName);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
-        setStoredSessionId(continuation);
+        setContinuation(config.providerName, continuation);
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -175,7 +186,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (continuation && config.provider.isSessionInvalid(err)) {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
-        clearStoredSessionId();
+        clearContinuation(config.providerName);
       }
 
       // Write error response so the user knows something went wrong
@@ -238,41 +249,96 @@ async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
+  providerName: string,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
-  // We do NOT force-end the stream on silence — keeping the query open is
-  // strictly cheaper than close+reopen (no cold prompt cache, no reconnect).
+  // We do NOT force-end the stream on silence — keeping the query open avoids
+  // re-spawning the SDK subprocess (~few seconds) and re-loading the .jsonl
+  // transcript on every turn. The Anthropic prompt cache is server-side with
+  // a 5-min TTL keyed on prefix hash, so stream lifecycle does NOT affect
+  // cache lifetime — close+reopen within 5 min still gets cache hits.
   // Stream liveness is decided host-side via the heartbeat file + processing
   // claim age (see src/host-sweep.ts); if something is truly stuck, the host
   // will kill the container and messages get reset to pending.
+  let pollInFlight = false;
+  let endedForCommand = false;
   const pollHandle = setInterval(() => {
-    if (done) return;
+    if (done || pollInFlight || endedForCommand) return;
+    pollInFlight = true;
 
-    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
-    // Thread routing is the router's concern — if a message landed in this
-    // session, the agent should see it. Per-thread sessions already isolate
-    // threads into separate containers; shared sessions intentionally merge
-    // everything. Filtering on thread_id here caused deadlocks when the
-    // initial batch and follow-ups had mismatched thread_ids (e.g. a
-    // host-generated welcome trigger with null thread vs a Discord DM reply).
-    const newMessages = getPendingMessages().filter((m) => {
-      if (m.kind === 'system') return false;
-      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
-      return true;
-    });
-    if (newMessages.length > 0) {
-      const newIds = newMessages.map((m) => m.id);
-      markProcessing(newIds);
+    void (async () => {
+      try {
+        const pending = getPendingMessages();
 
-      const prompt = formatMessages(newMessages);
-      log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
-      query.push(prompt);
+        // Slash commands need a fresh query: /clear resets the SDK's
+        // resume id (fixed at sdkQuery() time); admin/passthrough commands
+        // (/compact, /cost, …) only dispatch when they're the first input
+        // of a query — pushed mid-stream they arrive as plain text and
+        // the SDK never runs them. End the stream and leave the rows
+        // pending; the outer loop handles them on next iteration via the
+        // canonical command path + formatMessagesWithCommands.
+        if (pending.some((m) => isRunnerCommand(m))) {
+          log('Pending slash command — ending stream so outer loop can process');
+          endedForCommand = true;
+          query.end();
+          return;
+        }
 
-      markCompleted(newIds);
-    }
+        // Skip system messages (MCP tool responses).
+        // Thread routing is the router's concern — if a message landed in this
+        // session, the agent should see it. Per-thread sessions already isolate
+        // threads into separate containers; shared sessions intentionally merge
+        // everything. Filtering on thread_id here caused deadlocks when the
+        // initial batch and follow-ups had mismatched thread_ids (e.g. a
+        // host-generated welcome trigger with null thread vs a Discord DM reply).
+        const newMessages = pending.filter((m) => m.kind !== 'system');
+        if (newMessages.length === 0) return;
+
+        const newIds = newMessages.map((m) => m.id);
+        markProcessing(newIds);
+
+        // Run pre-task scripts on follow-ups too — without this, a task that
+        // arrives during an active query (e.g. a */10 monitoring cron) bypasses
+        // its script gate and always wakes the agent, defeating the gate.
+        // Mirrors the initial-batch hook above.
+        let keep = newMessages;
+        let skipped: string[] = [];
+        // MODULE-HOOK:scheduling-pre-task-followup:start
+        const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
+        const preTask = await applyPreTaskScripts(newMessages);
+        keep = preTask.keep;
+        skipped = preTask.skipped;
+        if (skipped.length > 0) {
+          markCompleted(skipped);
+          log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.join(', ')}`);
+        }
+        // MODULE-HOOK:scheduling-pre-task-followup:end
+
+        if (keep.length === 0) return;
+        // Re-check done — the outer query may have finished while the script
+        // was awaited. Pushing into a closed stream is wasted work; the
+        // claimed messages get released by the host's processing-claim sweep.
+        if (done) return;
+
+        const keptIds = keep.map((m) => m.id);
+        const prompt = formatMessages(keep);
+        log(`Pushing ${keep.length} follow-up message(s) into active query`);
+        query.push(prompt);
+        markCompleted(keptIds);
+      } catch (err) {
+        // Without this catch the rejection escapes the void IIFE and Node
+        // terminates the container on unhandled-rejection. The initial-batch
+        // path is wrapped by processQuery's outer try/catch; the follow-up
+        // path is not, so it needs its own.
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log(`Follow-up poll error: ${errMsg}`);
+      } finally {
+        pollInFlight = false;
+      }
+    })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
   try {
@@ -288,7 +354,7 @@ async function processQuery(
         // container died between `init` and `result`, the SDK session was
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
-        setStoredSessionId(event.continuation);
+        setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
